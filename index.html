@@ -1,165 +1,161 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Snake.io Multiplayer Enhanced</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
-  <style>
-    body { background: #181920; margin: 0; font-family: sans-serif; overflow:hidden;}
-    #game { background:#222; margin:20px auto 0; display:block; border:3px solid #2f8; }
-    #score { color: #2f8; text-align: center; font-size: 2em; padding-top:10px;}
-    #scoreboard {
-      background:rgba(16,24,32,0.95);
-      color:#fff; position:fixed;top:5px;right:7px;z-index:3;
-      border:2px solid #2f8;border-radius:8px;padding:12px;font-size:1.1em;
-      min-width:140px;max-width:210px;
+// SNAKEY SNAKEY Multiplayer Server
+// 50x50 grid, 7 foods, top scorer disco, custom player color by nickname
+
+const express = require('express');
+const app = express();
+const http = require('http').Server(app);
+const io = require('socket.io')(http, { cors: { origin: '*' } });
+
+const GRID_SIZE = 50;
+const FOOD_COUNT = 7;
+const centerCell = { x: Math.floor(GRID_SIZE / 2), y: Math.floor(GRID_SIZE / 2) };
+
+let rooms = {};
+
+function randomEmptyCell(occupied = []) {
+  let pos;
+  let tries = 0;
+  do {
+    pos = {
+      x: Math.floor(Math.random() * GRID_SIZE),
+      y: Math.floor(Math.random() * GRID_SIZE)
+    };
+    tries++;
+  } while (
+    occupied.some(o => o.x === pos.x && o.y === pos.y) && tries < 300
+  );
+  return pos;
+}
+
+function initFoods(snakes) {
+  let occupied = [];
+  snakes.forEach(s => occupied = occupied.concat(s));
+  let foods = [];
+  let safety = 0;
+  while (foods.length < FOOD_COUNT && safety < 1000) {
+    const pos = randomEmptyCell(foods.concat(occupied));
+    if (!foods.some(f => f.x === pos.x && f.y === pos.y)) {
+      foods.push(pos);
     }
-    #scoreboard h3 {margin:0 0 8px 0;color:#2f8;}
-    #touches { position:fixed;bottom:10px;left:0;right:0;text-align:center;}
-    .btn {width:66px;height:66px;margin:8px;background:#232;border:2px solid #2f8;border-radius:50%;display:inline-block;line-height:66px;font-size:2em;color:#fff;user-select:none;}
-  </style>
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-</head>
-<body>
-  <div id="scoreboard"></div>
-  <canvas id="game" width="340" height="340"></canvas>
-  <div id="score"></div>
-  <div id="touches">
-    <div class="btn" id="btnLeft">&#8592;</div>
-    <div class="btn" id="btnUp">&#8593;</div>
-    <div class="btn" id="btnDown">&#8595;</div>
-    <div class="btn" id="btnRight">&#8594;</div>
-  </div>
-<script>
-const socket = io('https://supreme-octo-palm-tree-5x9j.onrender.com/');
+    safety++;
+  }
+  return foods;
+}
 
-const roomName = prompt("Room name?") || "default";
-const playerName = prompt("Your nickname?") || "anon";
-socket.emit("joinRoom", {room:roomName, name:playerName});
+function hashNick(nick) {
+  let hash = 0;
+  for (let i = 0; i < nick.length; i++) {
+    hash = ((hash << 5) - hash) + nick.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
 
-// --- Client-side "gameloop" and model
-const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
-const scale = 17, rows = 20, cols = 20;
-let dir = "right", score=0, gameOver=false;
-let players = {}, foods = [{x:10,y:10}];
-let mySnake = [{x:2,y:2}]; // local player only
+io.on('connection', socket => {
+  let room, name;
 
-// --- Drawing
-function draw() {
-  ctx.fillStyle="#222"; ctx.fillRect(0,0,canvas.width,canvas.height);
-
-  // Multiple foods
-  foods.forEach(food=>{
-    ctx.fillStyle="#fc3"; ctx.beginPath();
-    ctx.arc(food.x*scale+scale/2, food.y*scale+scale/2, scale/2-1, 0, 2*Math.PI);
-    ctx.fill();
+  socket.on('joinRoom', data => {
+    room = data.room ? String(data.room).slice(0, 40) : "default";
+    name = data.name ? String(data.name).slice(0, 24) : "anon";
+    if (!rooms[room]) {
+      rooms[room] = {
+        players: {},
+        foods: []
+      };
+    }
+    // Remove ghost slot if present
+    delete rooms[room].players[socket.id];
+    rooms[room].players[socket.id] = {
+      id: socket.id,
+      name: name,
+      colorSeed: hashNick(name),
+      snake: [{ x: centerCell.x, y: centerCell.y }],
+      score: 0,
+      dir: 'right',
+      moveTime: 0,
+      joined: Date.now()
+    };
+    const snakesFlat = Object.values(rooms[room].players).map(p => p.snake).flat();
+    if (rooms[room].foods.length < FOOD_COUNT) {
+      rooms[room].foods = initFoods(snakesFlat);
+    }
+    socket.join(room);
+    io.to(room).emit('gameState', getState(room));
   });
 
-  // Snakes
-  Object.values(players).forEach(p=>{
-    p.snake.forEach((seg,i)=>{
-      ctx.fillStyle = i ? "#2f8" : (p.id === socket.id ? "#fff" : "#8cf");
-      ctx.fillRect(seg.x*scale, seg.y*scale, scale, scale);
-    });
-    ctx.fillStyle="#fff";
-    ctx.font="12px sans-serif";
-    ctx.fillText(p.name+(p.id===socket.id?" (you)":"") , p.snake[0].x*scale, p.snake[0].y*scale-2);
+  function canMove(player) {
+    const now = Date.now();
+    if (now - player.moveTime < 60) return false;
+    player.moveTime = now;
+    return true;
+  }
+
+  socket.on('update', data => {
+    if (!room || !rooms[room] || !rooms[room].players[socket.id]) return;
+    const player = rooms[room].players[socket.id];
+    if (!canMove(player)) return;
+    player.snake = Array.isArray(data.snake) ? data.snake : player.snake;
+    player.score = typeof data.score === 'number' ? data.score : player.score;
+    io.to(room).emit('gameState', getState(room));
   });
 
-  document.getElementById('score').textContent =
-    gameOver ? "Game Over! Tap any direction to restart" : "Score: "+score;
-}
+  socket.on('eatFood', coords => {
+    if (!room || !rooms[room]) return;
+    let foods = rooms[room].foods || [];
+    foods = foods.filter(f => !(f.x === coords.x && f.y === coords.y));
+    const snakesFlat = Object.values(rooms[room].players).map(p => p.snake).flat();
+    let safety = 0;
+    while (foods.length < FOOD_COUNT && safety < 1000) {
+      const newPos = randomEmptyCell(foods.concat(snakesFlat));
+      if (!foods.some(f => f.x === newPos.x && f.y === newPos.y)) {
+        foods.push(newPos);
+      }
+      safety++;
+    }
+    rooms[room].foods = foods;
+    io.to(room).emit('gameState', getState(room));
+  });
 
-// --- Scoreboard (sorted)
-function drawScoreboard() {
-  let html = `<h3>Scoreboard</h3>`;
-  let items = Object.values(players)
-    .sort((a,b)=>b.score-a.score)
-    .map(p=>`<b style="color:#2f8">${p.score}</b> – <span style="color:${p.id===socket.id?'#fff':'#8cf'}">${p.name}${p.id===socket.id?' (you)':''}</span>`);
-  document.getElementById('scoreboard').innerHTML = html + items.join("<br>");
-}
+  socket.on('restart', () => {
+    if (!room || !rooms[room] || !rooms[room].players[socket.id]) return;
+    rooms[room].players[socket.id].score = 0;
+    rooms[room].players[socket.id].snake = [{ x: centerCell.x, y: centerCell.y }];
+    rooms[room].players[socket.id].dir = 'right';
+    io.to(room).emit('gameState', getState(room));
+  });
 
-// --- Touch/Swipe Buttons (turn-based movement)
-function setDir(d) {
-  if(gameOver){ restart(); return; }
-  // Only allow 90-degree turns
-  if(d==="up" && dir!=="down") dir="up";
-  else if(d==="down" && dir!=="up") dir="down";
-  else if(d==="left" && dir!=="right") dir="left";
-  else if(d==="right" && dir!=="left") dir="right";
-  moveSnake(); // Only move on touch!
-}
-["Left","Up","Down","Right"].forEach(d=>{
-  document.getElementById("btn"+d).ontouchstart = document.getElementById("btn"+d).onclick = ()=>setDir(d.toLowerCase());
+  socket.on('disconnect', () => {
+    if (!room || !rooms[room]) return;
+    delete rooms[room].players[socket.id];
+    if (Object.keys(rooms[room].players).length === 0) {
+      delete rooms[room];
+    } else {
+      io.to(room).emit('gameState', getState(room));
+    }
+  });
 });
 
-// --- Single move per tap: moves in the current direction by one step only!
-function moveSnake(){
-  if(gameOver) return;
-  let head = {...mySnake[0]};
-  if(dir=="up") head.y--;
-  if(dir=="down") head.y++;
-  if(dir=="left") head.x--;
-  if(dir=="right") head.x++;
-  // Collision
-  if(head.x<0||head.x>=cols||head.y<0||head.y>=rows
-     || mySnake.some(p=>p.x==head.x&&p.y==head.y)) {
-    gameOver=true; draw(); drawScoreboard();
-    return;
-  }
-  mySnake.unshift(head);
-
-  // Eat food?
-  let ateFood = false;
-  let eatenIndex = -1;
-  foods.forEach((f,idx)=>{
-    if(head.x==f.x && head.y==f.y) {
-      ateFood = true;
-      eatenIndex = idx;
+function getState(room) {
+  if (!rooms[room]) return {};
+  let bestPlayerId = null, maxScore = -1, earliest = Date.now() + 100000;
+  for (let pid in rooms[room].players) {
+    let p = rooms[room].players[pid];
+    if (p.score > maxScore || (p.score === maxScore && p.joined < earliest)) {
+      bestPlayerId = p.id;
+      maxScore = p.score;
+      earliest = p.joined;
     }
-  });
-  if(ateFood) {
-    score++;
-    // Remove the eaten food
-    foods.splice(eatenIndex,1);
-    // Request new food item from others/server
-    socket.emit("eatFood", {x: head.x, y: head.y});
-  } else {
-    mySnake.pop();
   }
-  // Notify only when acted
-  socket.emit("update", {snake: mySnake, score: score});
-  draw(); drawScoreboard();
+  let playerStates = {};
+  for (let pid in rooms[room].players) {
+    let p = rooms[room].players[pid];
+    playerStates[pid] = { ...p, disco: (pid === bestPlayerId) };
+  }
+  return {
+    players: playerStates,
+    foods: rooms[room].foods
+  };
 }
 
-// --- Restart
-function restart(){
-  dir="right"; score=0; gameOver=false; mySnake = [{x:2,y:2}];
-  socket.emit("restart");
-  draw(); drawScoreboard();
-}
-
-// --- Server sync
-socket.on("gameState", data => {
-  // Handle either {players, food} or {players, foods}
-  players = data.players || {};
-  // Support multi-food by using foods from server; fallback for single food
-  if(Array.isArray(data.foods)) {
-    foods = data.foods;
-  } else if(data.food) {
-    foods = [data.food];
-  }
-  Object.values(players).forEach(p=>{
-    if(p.id===socket.id){
-      mySnake = p.snake;
-      score = p.score;
-    }
-  });
-  draw(); drawScoreboard();
-});
-socket.on("dead", ()=>{ gameOver=true; draw(); drawScoreboard(); });
-
-</script>
-</body>
-</html>
+const port = process.env.PORT || 3000;
+http.listen(port, () => console.log('SNAKEY SNAKEY server running on port ' + port));
